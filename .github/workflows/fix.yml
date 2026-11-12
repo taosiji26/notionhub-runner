@@ -34,7 +34,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NOTIONHUB_API_BASE: https://i.notionhub.app/v1
-      NOTIONHUB_CONFIG_VERSION: '51'
+      NOTIONHUB_CONFIG_VERSION: '69'
       WEREAD_CONFIG: ${{ secrets.WEREAD_CONFIG }}
       PODCAST_CONFIG: ${{ secrets.PODCAST_CONFIG }}
       DOUBAN_CONFIG: ${{ secrets.DOUBAN_CONFIG }}
@@ -85,10 +85,31 @@ jobs:
       - name: 获取短期修复授权
         id: authorize
         run: |
-          OIDC_TOKEN=$(curl -fsSL -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty')
-          echo "::add-mask::$OIDC_TOKEN"
           AUTH_RESPONSE="$RUNNER_TEMP/notionhub-authorize.json"
-          HTTP_STATUS=$(curl -sS -o "$AUTH_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/authorize-run"             -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json'             --data "{\"service\":\"${{ steps.validate.outputs.service }}\",\"purpose\":\"fix\"}")
+          # The Worker consumes the OIDC jti when authorize-run succeeds. A
+          # transport retry must therefore mint a fresh token before retrying.
+          HTTP_STATUS=000
+          for ATTEMPT in 1 2 3 4; do
+            OIDC_TOKEN=$(curl -fsSL --max-time 30 -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN"               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=https%3A%2F%2Fi.notionhub.app" | jq -r '.value // empty') || OIDC_TOKEN=""
+            if [ -n "$OIDC_TOKEN" ]; then
+              echo "::add-mask::$OIDC_TOKEN"
+              HTTP_STATUS=$(curl -sS --max-time 120 -o "$AUTH_RESPONSE" -w '%{http_code}' -X POST "$NOTIONHUB_API_BASE/github/runner/authorize-run"                 -H "Authorization: Bearer $OIDC_TOKEN" -H 'Content-Type: application/json'                 --data "{\"service\":\"${{ steps.validate.outputs.service }}\",\"purpose\":\"fix\"}") || HTTP_STATUS=000
+              unset OIDC_TOKEN
+            else
+              HTTP_STATUS=000
+            fi
+            case "$HTTP_STATUS" in
+              2??) break ;;
+              408|429|5??|000)
+                if [ "$ATTEMPT" -lt 4 ]; then sleep $((ATTEMPT * 2)); fi
+                ;;
+              4??|*) break ;;
+            esac
+          done
+          if [ "$HTTP_STATUS" = "000" ]; then
+            echo "::error title=修复授权失败::无法获取 GitHub OIDC token 或连接授权服务。"
+            exit 1
+          fi
           if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ]; then
             MESSAGE=$(jq -r '.message // "修复授权失败"' "$AUTH_RESPONSE")
             echo "::error title=修复授权失败::$MESSAGE"
@@ -133,7 +154,11 @@ jobs:
           python -m pip install --quiet --disable-pip-version-check --upgrade pip
           if [ -f runner/requirements.txt ]; then pip install --quiet --disable-pip-version-check -r runner/requirements.txt; fi
           SERVICE_REQUIREMENTS=$(cd runner && python -m notionhub_runner requirements "${{ steps.validate.outputs.service }}")
-          if [ -f "$SERVICE_REQUIREMENTS" ]; then pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS"; fi
+          if [ -f "$SERVICE_REQUIREMENTS" ]; then
+            SERVICE_REQUIREMENTS_DIR=$(dirname "$SERVICE_REQUIREMENTS")
+            SERVICE_REQUIREMENTS_FILE=$(basename "$SERVICE_REQUIREMENTS")
+            (cd "$SERVICE_REQUIREMENTS_DIR" && pip install --quiet --disable-pip-version-check -r "$SERVICE_REQUIREMENTS_FILE")
+          fi
 
       - name: 修复数据
         id: fix
